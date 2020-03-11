@@ -1,138 +1,249 @@
+'''
+Solve the wave equation using finite elements for the spatial discretization
+and the Newmark method for time integration.
 
+'''
+
+import dolfin
 from dolfin import *
+from dolfin import pi as PI
 
-import numpy as np
-import matplotlib.pyplot as plt
+EPS = 1e-12
 
-nx = ny = 60
-diagonal = "crossed"
-degree = 1
-mesh = UnitSquareMesh(nx, ny, diagonal=diagonal)
+### Solution file
 
-outfile_u = File("./out/u.pvd")
+# class NemarkSolver:
+#     def __init__(self, form_M, form_K, beta=0.25, gamma=0.5)
+#     pass
+#     def solve(self, x, rhs)
 
-### Parameters
+class PeriodicWriter:
+    '''Writes ".pvd" files.'''
 
-c = 1.0
-omega = 2*np.pi
+    def __init__(self, filename:str, func:dolfin.Function, start:int=0, step:int=1):
 
-nk = 2400
-t_final = 8
-dt = t_final / nk
+        if not isinstance(filename, str):
+            raise TypeError('Parameter `filename` must be a `str`')
 
-theta = 1.0
+        if not isinstance(func, dolfin.Function):
+            raise TypeError('Parameter `func` must be a `dolfin.Function`')
 
-c_ = Constant(c)
-dt_ = Constant(dt)
-theta_ = Constant(theta)
+        if not filename.endswith(".pvd"):
+            filename += ".pvd"
 
+        self.file = dolfin.File(filename)
+        self.func = func
 
+        self.count = -1
+        self.start = start
+        self.step  = step
 
-### Source term
+    def write(self, force=False):
 
-# g1 = Expression(" exp(-50*(pow(x[0], 2) + pow(x[1], 2)))", degree=3)
-# g2 = Expression(" exp(-50*(pow((x[0]-1.0), 2) + pow((x[1]-1.0), 2)))", degree=3)
-# g3 = Expression(" exp(-50*(pow((x[0]-0.5), 2) + pow((x[1]-0.5), 2)))", degree=4)
+        self.count += 1
 
-# gn = Constant(0.0)
-# N = FacetNormal(mesh)
-# g = gn * N
+        if self.count < self.start:
+            return
 
-### Boundary conditions
+        if (self.count-self.start) % self.step == 0 or force:
+            self.file << self.func
 
-u_D = Expression((f"sin({omega}*t)", "0.0"), t=0.0, degree=3)
-dudt_D = Expression((f"{omega}*cos({omega}*t)", "0.0"), t=0.0, degree=3)
-
-### Function space
-
-V = VectorFunctionSpace(mesh, 'CG', degree)
-S = FunctionSpace(mesh, ('CG' if degree > 1 else 'DG'), degree-1)
-
-bc_u    = [DirichletBC(V, u_D, lambda x, on_boundary: (x[0] < 1e-6) and on_boundary),]
-bc_dudt = [DirichletBC(V, dudt_D, lambda x, on_boundary: (x[0] < 1e-6) and on_boundary),]
-
-bc_dofs = list(bc_u[0].get_boundary_values().keys())
-
-def compute_bc_values_u():
-    return list(bc_u[0].get_boundary_values().values())
-
-def compute_bc_values_dudt():
-    return list(bc_dudt[0].get_boundary_values().values())
-
-v = TestFunction(V)
-u = TrialFunction(V)
-
-M = dot(u, v) * dx
-K = inner(grad(u), grad(v)) * dx
-
-lhs = assemble((1/c_**2)*M + (0.5*theta_*dt_**2)*K)
-rhs_1 = assemble((1/c_**2)*M - (0.5*(1.0-theta_)*dt_**2)*K)
-rhs_2 = assemble(-dt_*K)
-
-u = Function(V, name="u")
-dudt = Function(V, name="du/dt")
-dudt_k = Function(V, name="du/dt (prev.)")
-
-t = 0
-
-# This only zeros-out the rows and puts ones on the diagonal (DO ONCE)
-for bc_i in bc_dudt:
-    bc_i.apply(lhs)
-
-try:
-
-    i = 0
-    while t < t_final:
-
-        u_D.t = t
-        dudt_D.t = t
-
-        dudt_k.vector()[:] = dudt.vector()
-
-        u.vector()[bc_dofs] = compute_bc_values_u()
-        dudt_k.vector()[bc_dofs] = compute_bc_values_dudt()
-
-        rhs = rhs_1*dudt_k.vector() + rhs_2*u.vector()
-
-        t += dt
-
-        u_D.t = t
-        dudt_D.t = t
-
-        for bc_i in bc_dudt:
-            bc_i.apply(rhs)
-
-        print("Solve for {0:.3f}".format(t))
-        solve(lhs, dudt.vector(), rhs)
-
-        u.vector()[:] += (dudt_k.vector()*((1.0-theta)*dt) + dudt.vector()*(theta*dt))
-
-        if i % 20 == 0:
-            outfile_u << u
-
-        i += 1
-
-except KeyboardInterrupt:
-    print("\nCought a `KeyboardInterrupt`\n")
-    pass
+    def reset(self):
+        self.count = -1
 
 
-# div_E = project(div(u), S)
-# div_E.rename("div_E", "")
-#
-# curl_E = project(curl(u), S)
-# curl_E.rename("curl_E", "")
-#
-# fh = plt.figure(1)
-# fh.clear()
-# plot(u)
-# plt.show()
-#
-# File("electric_field.pvd") << u
-#
-# File("error_div.pvd") << div_E
-# File("error_curl.pvd") << curl_E
-#
-# print("norm(u):\n", "{0:.6f}".format(norm(u)))
-# print("norm(div(u)-g)\n", "{0:.6f}".format(assemble((div_E-g)**2*dx)))
-# print("norm(curl(u):\n", "{0:.6f}".format(assemble(curl_E**2*dx)))
+class Solver:
+
+    def __init__(self, u, u_bc, dudt_bc, d2udt2_bc, set_bcs_time,
+                 dirichlet_boundary, homogeneous_boundary=None):
+
+        self._u = u
+        self._V = u.function_space()
+
+        self._dudt = Function(V, name="dudt")
+        self._d2udt2 = Function(V, name="d2udt2")
+
+        ### Weak form
+
+        v0 = TestFunction(V)
+        v1 = TrialFunction(V)
+
+        self._form_M = dot(v1, v0) * dx
+        self._form_K = 1/c**2*inner(grad(v1), grad(v0)) * dx
+
+        ### BC's
+
+        self.bcs_u      = [DirichletBC(V, u_bc, dirichlet_boundary),]
+        self.bcs_dudt   = [DirichletBC(V, dudt_bc, dirichlet_boundary),]
+        self.bcs_d2udt2 = [DirichletBC(V, d2udt2_bc, dirichlet_boundary),]
+
+        if homogeneous_boundary is not None:
+            zeros = Constant((0.0, 0.0))
+            self.bcs_u.append(DirichletBC(V, zeros, homogeneous_boundary))
+            self.bcs_dudt.append(DirichletBC(V, zeros, homogeneous_boundary))
+            self.bcs_d2udt2.append(DirichletBC(V, zeros, homogeneous_boundary))
+
+        self.set_bcs_time = set_bcs_time
+
+    def solve(self, u_ic, dudt_ic, dt, T, beta=0.25, gamma=0.5, solution_writer=None):
+        '''
+        Newmark parameters
+        beta = 0.25 # 0..0.5
+        gamma = 0.5 # 0..1.0
+        '''
+
+        # Linear systems
+        M = assemble(self._form_M)
+        K = assemble(self._form_K)
+
+        # LHS for the Newmark method
+        A = M + K*(beta*dt**2)
+
+        for bc_i in self.bcs_d2udt2:
+            bc_i.apply(M)
+            bc_i.apply(A)
+
+        init_solver = LUSolver(M)
+        loop_solver = LUSolver(A, "mumps")
+
+        u_vec = self._u.vector()
+        v_vec = self._dudt.vector()
+        a_vec = self._d2udt2.vector()
+        a_vec_star = a_vec.copy()
+
+        # Assign initial conditions
+        u_vec[:] = interpolate(u_ic, self._V).vector()
+        v_vec[:] = interpolate(dudt_ic, self._V).vector()
+
+        if solution_writer is None:
+            solution_writer = type("DummyClass", (),
+                {"write": lambda : None})
+
+        try:
+
+            i = 0
+            t = 0.0
+
+            self.set_bcs_time(t)
+
+            for bc_i in self.bcs_u:
+                bc_i.apply(u_vec)
+
+            for bc_i in self.bcs_dudt:
+                bc_i.apply(v_vec)
+
+            rhs = -(K*u_vec)
+
+            for bc_i in self.bcs_d2udt2:
+                bc_i.apply(rhs)
+
+            init_solver.solve(a_vec, rhs)
+
+            while i != nt:
+
+                rhs = -(K*(u_vec + v_vec*dt + a_vec*((0.5-beta)*dt**2)))
+
+                a_vec_star[:] = a_vec
+
+                for bc_i in self.bcs_d2udt2:
+                    bc_i.apply(rhs)
+
+                loop_solver.solve(a_vec, rhs)
+
+                u_vec += v_vec*dt + (a_vec_star*(0.5-beta) + a_vec*beta)*(dt**2)
+                v_vec += (a_vec_star*(1.0-gamma) + a_vec*gamma)*dt
+
+                i += 1
+                t += dt
+
+                self.set_bcs_time(t)
+
+                for bc_i in self.bcs_u:
+                    bc_i.apply(u_vec)
+
+                for bc_i in self.bcs_dudt:
+                    bc_i.apply(v_vec)
+
+                solution_writer.write()
+
+                print("{0:d}/{1:d}: Energy={2:.3e}"
+                    .format(i, nt, 0.5*(M*u_vec).inner(u_vec)))
+
+        except KeyboardInterrupt:
+            print("\nCought a `KeyboardInterrupt`\n")
+
+
+if __name__ == "__main__":
+
+    maximum_writes = 200
+
+    ### Physical parameters
+
+    c = 1.0 # Speed of light 300e6 (m/s)
+    T = 4.0
+
+    ### Mesh
+
+    nx = ny = 160
+
+    mesh = UnitSquareMesh(nx, ny, diagonal="crossed")
+
+    ### Solver parameters
+
+    CFL = 1/3
+    dt = CFL*mesh.hmin()/c
+
+    nt = int(T*(1+EPS) / dt)
+
+    solution_writing_period = (nt // maximum_writes)
+
+    ### Initial conditions
+
+    u_ic = Expression(('0.0','0.0'), degree=0)
+    dudt_ic = Expression(('0.0','0.0'), degree=0)
+
+    ### Boundary conditions
+
+    # omega = PI
+    # omega = 2*PI
+    omega = 4*PI
+    alpha = 0.1
+
+    kernel_u = "exp(-(pow((xc-x[0])/a,2) + pow((yc-x[1])/a,2)))"
+
+    u_bc = Expression((f"sin(w*t)*{kernel_u}",)*2, t=0.0, xc=0.0, yc=0.0, w=omega, a=alpha, degree=2)
+    dudt_bc = Expression((f"w*cos(w*t)*{kernel_u}",)*2, t=0.0, xc=0.0, yc=0.0, w=omega, a=alpha, degree=2)
+    d2udt2_bc = Expression((f"-w*w*sin(w*t)*{kernel_u}",)*2, t=0.0, xc=0.0, yc=0.0, w=omega, a=alpha, degree=2)
+
+    def dirichlet_boundary(x, on_boundary):
+        return ((x[0] < 1e-6) or (x[1] < 1e-6)) and on_boundary
+
+    def homogeneous_boundary(x, on_boundary):
+        return ((x[0] > 1-1e-6) or (x[1] > 1-1e-6)) and on_boundary
+
+    # homogeneous_boundary = None
+
+    ### Function space
+
+    degree = 1
+
+    V = VectorFunctionSpace(mesh, 'CG', degree)
+
+    u = Function(V, name="u")
+
+    ### Define solver
+
+    def set_bcs_time(t):
+        u_bc.t = t
+        dudt_bc.t = t
+        d2udt2_bc.t = t
+
+    solution_writer = PeriodicWriter("./out/u.pvd",
+        u, start=1, step=solution_writing_period)
+
+    solver = Solver(u, u_bc, dudt_bc, d2udt2_bc, set_bcs_time,
+                    dirichlet_boundary, homogeneous_boundary)
+
+    solver.solve(u_ic, dudt_ic, dt, T, solution_writer=solution_writer)
+
+    print("Done")
